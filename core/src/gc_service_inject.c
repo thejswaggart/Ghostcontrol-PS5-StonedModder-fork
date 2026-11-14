@@ -12,6 +12,7 @@
 #include "gc_rawmap.h"
 #include "gc_types.h"
 #include "gc_usb.h"
+#include "gc_usb_opener.h"
 #include "controller_ds4.h"
 #include "controller_mamba.h"
 #include "controller_nintendo.h"
@@ -255,6 +256,12 @@ typedef struct {
      * stay silent until the host answers their ANNOUNCE and powers them on. */
     int gip;
     XboxControllerState xbox;
+    /* The GIP handshake runs on its own thread (up to ~1.6 s) so usb_tick
+     * never holds source_dispatch_lock across it. While opening is set the
+     * worker owns fd, ep and xbox; usb_tick leaves the feed alone until
+     * usb_gip_open_finish() has reaped it. */
+    int opening;
+    GcUsbOpener opener;
     /* Genuine DualShock 4 on USB: its lightbar stays dark until the host sends
      * output report 0x05, so the feed opens the OUT pipe once to set it. */
     int ds4_out;
@@ -637,6 +644,8 @@ int gc_service_inject_close_checked(void)
 {
     if (!source_dispatch_lock()) return -1;
     for (int i = 0; i < USB_SLOTS; ++i) {
+        (void)gc_usb_opener_cancel(&usb_feed[i].opener);
+        usb_feed[i].opening = 0;
         if (usb_release_fd(&usb_feed[i]) != 0) {
             source_dispatch_unlock(); return -1;
         }
@@ -1051,6 +1060,41 @@ static void usb_nintendo_kick(UsbFeed *feed)
     log_line("usb: %s nintendo kick [80 02]=%d [80 04]=%d", feed->path, ok1, ok2);
 }
 
+static void usb_close_feed(UsbFeed *feed);
+
+static int usb_gip_open_work(void *argument, GcUsbOpenerKeepRunning keep_running,
+                             void *context)
+{
+    UsbFeed *feed = argument;
+    return xbox_gip_handshake(feed->fd, feed->ep, feed->vid, feed->pid, &feed->xbox,
+                              keep_running, context);
+}
+
+/* 0 while the handshake runs, 1 once the feed is ready to read, -1 if it failed
+ * and the feed was closed. */
+static int usb_gip_open_finish(UsbFeed *feed)
+{
+    int handshake = 0;
+    const int polled = gc_usb_opener_poll(&feed->opener, &handshake);
+    if (polled == 0) return 0;
+    feed->opening = 0;
+    log_line("usb: %s GIP handshake result=%d", feed->path, handshake);
+    if (polled < 0 || handshake < 0) {
+        usb_close_feed(feed);
+        return -1;
+    }
+    /* The handshake drove ep[0] with its own buffers; point it back. */
+    feed->ep[0].ppBuffer = (void **)&feed->bufp;
+    feed->ep[0].pLength = &feed->lenp;
+    feed->ep[0].nFrames = 1;
+    feed->ep[0].aFrames = 0;
+    feed->ep[0].status = 0;
+    feed->ep[0].timeout = 0;
+    feed->ep[0].flags = USB_FS_FLAG_SINGLE_SHORT_OK;
+    feed->lenp = feed->in_xfer_len;
+    return 1;
+}
+
 static int usb_open_feed(UsbFeed *feed, const GcUsbDevice *device)
 {
     struct usb_fs_init init;
@@ -1211,24 +1255,6 @@ static int usb_open_feed(UsbFeed *feed, const GcUsbDevice *device)
             return 0;
         }
         feed->xbox.out_available = 1;
-        /* Bounded (about 1.6 s): ANNOUNCE -> ACK -> power on, as the resident
-         * line does. A late ANNOUNCE is answered again in xbox_handle_packet. */
-        const int handshake = xbox_gip_handshake(feed->fd, feed->ep, device->vid, device->pid,
-                                                 &feed->xbox, NULL, NULL);
-        log_line("usb: %s GIP handshake result=%d", device->path, handshake);
-        if (handshake < 0) {
-            (void)usb_release_fd(feed);
-            return 0;
-        }
-        /* The handshake drove ep[0] with its own buffers; point it back. */
-        feed->ep[0].ppBuffer = (void **)&feed->bufp;
-        feed->ep[0].pLength = &feed->lenp;
-        feed->ep[0].nFrames = 1;
-        feed->ep[0].aFrames = 0;
-        feed->ep[0].status = 0;
-        feed->ep[0].timeout = 0;
-        feed->ep[0].flags = USB_FS_FLAG_SINGLE_SHORT_OK;
-        feed->lenp = feed->in_xfer_len;
     }
     snprintf(feed->path, sizeof feed->path, "%s", device->path);
     feed->vid = device->vid; feed->pid = device->pid; feed->kind = device->kind;
@@ -1236,8 +1262,21 @@ static int usb_open_feed(UsbFeed *feed, const GcUsbDevice *device)
     feed->interface_number = device->interface_number;
     feed->alternate_setting = device->alternate_setting;
     feed->in_ep = device->in[0];
-    feed->used = 1;
     feed->slot = -1;
+    if (feed->gip) {
+        /* Bounded (about 1.6 s): ANNOUNCE -> ACK -> power on, as the resident
+         * line does, now off the tick. A late ANNOUNCE is answered again in
+         * xbox_handle_packet. */
+        const int rc = gc_usb_opener_start(&feed->opener, usb_gip_open_work, feed);
+        if (rc != 0) {
+            log_line("usb: %s GIP handshake thread failed (%s)", device->path, strerror(rc));
+            (void)usb_release_fd(feed);
+            errno = rc;
+            return 0;
+        }
+        feed->opening = 1;
+    }
+    feed->used = 1;
     return 1;
 }
 
@@ -1245,6 +1284,13 @@ static void usb_close_feed(UsbFeed *feed)
 {
     if (!feed->used) return;
     if (!source_dispatch_lock()) return;
+    if (gc_usb_opener_active(&feed->opener)) {
+        /* The handshake checks for cancellation every 20 ms poll slice; an
+         * unplugged device fails its next transfer at once. */
+        const int handshake = gc_usb_opener_cancel(&feed->opener);
+        log_line("usb: %s GIP handshake cancelled (result=%d)", feed->path, handshake);
+    }
+    feed->opening = 0;
     /* The next device on this node must have its descriptor read again. */
     gc_usb_hid_layout_forget(feed->path);
     if (usb_release_fd(feed) != 0) { source_dispatch_unlock(); return; }
@@ -1372,6 +1418,9 @@ static void usb_tick(void)
             log_line("usb: %s %04x:%04x opened", devices[i].path,
                      devices[i].vid, devices[i].pid);
         }
+        /* A GIP feed is not read, polled or given a slot until its handshake
+         * thread has finished; the other feeds carry on meanwhile. */
+        if (feed->opening && usb_gip_open_finish(feed) <= 0) continue;
         if (feed->slot < 0) {
             int slot = free_slot();
             if (slot < 0) continue;
