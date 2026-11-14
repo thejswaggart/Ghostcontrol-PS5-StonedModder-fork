@@ -1461,6 +1461,26 @@ static void usb_tick(void)
                 }
             }
         }
+        if (feed->gip && !feed->busy) {
+            /* The report that ended the handshake is real input. Publish it
+             * through the normal path: GIP will not repeat it until it changes. */
+            const uint32_t initial = xbox_take_initial_report(&feed->xbox, feed->report,
+                                                              sizeof feed->report);
+            if (initial) {
+                feed->lenp = initial;
+                source_snapshot_lock();
+                if (policy_revoked[feed->slot] ||
+                    atomic_load_explicit(&source_fault, memory_order_acquire)) {
+                    source_snapshot_unlock();
+                    continue;
+                }
+                raw_sample(feed->slot, feed->report, feed->lenp);
+                source_snapshot_unlock();
+                if (usb_decode(feed, &devices[i], &state))
+                    remember(feed->slot, &state, devices[i].vid, devices[i].pid);
+                continue;
+            }
+        }
         if (!feed->busy) {
             feed->lenp = feed->in_xfer_len ? feed->in_xfer_len : USB_REPORT;
             feed->ep[0].nFrames = 1;
