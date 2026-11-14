@@ -1245,6 +1245,8 @@ static void usb_close_feed(UsbFeed *feed)
 {
     if (!feed->used) return;
     if (!source_dispatch_lock()) return;
+    /* The next device on this node must have its descriptor read again. */
+    gc_usb_hid_layout_forget(feed->path);
     if (usb_release_fd(feed) != 0) { source_dispatch_unlock(); return; }
     if (feed->slot >= 0) {
         source_snapshot_lock();
