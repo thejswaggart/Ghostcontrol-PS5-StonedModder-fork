@@ -775,6 +775,45 @@ static void remap_state(int slot, const GcProfile *profile, pad_state *state)
     state->l2 = pad.analogButtons.l2; state->r2 = pad.analogButtons.r2;
 }
 
+/* Mirrors k_player_colours in bt/host.c: the lightbar colour and 1-based
+ * player number the BT engine seeds onto each pad at link-ready. Rumble output
+ * re-asserts these so driving the motors never disturbs the lightbar or player
+ * LED (gc_bt_set_output writes the whole output report at once). */
+static const struct { uint8_t r, g, b, player; } k_source_colour[GC_BT_MAX_PADS] = {
+    { 0x00, 0x00, 0x40, 1 },   /* blue  */
+    { 0x40, 0x00, 0x00, 2 },   /* red   */
+    { 0x00, 0x40, 0x00, 3 },   /* green */
+    { 0x20, 0x00, 0x20, 4 },   /* pink  */
+};
+
+/* Reads the game's requested rumble for a live BT source (from the virtual
+ * DualSense that backs it) and pushes it to the physical controller through
+ * the engine's output queue, but only when the level changes: the engine
+ * re-sends a non-zero level on its own rumble-refresh timer, and vpad_rumble's
+ * staleness logic drops a held value back to 0. This is the missing SOURCE for
+ * gc_bt_set_output, which had no game-rumble caller before. */
+static void feed_source_rumble(GcBt *bt, int source, int slot,
+                               const GcBtOrigin *origin, int live)
+{
+    static uint8_t last_strong[GC_BT_MAX_PADS];
+    static uint8_t last_weak[GC_BT_MAX_PADS];
+    static int     have_last[GC_BT_MAX_PADS];
+    uint8_t strong = 0, weak = 0;
+
+    if (!live || slot < 0 || !vpad_rumble(slot, &strong, &weak)) {
+        have_last[source] = 0;
+        return;
+    }
+    if (have_last[source] && strong == last_strong[source] && weak == last_weak[source])
+        return;
+    last_strong[source] = strong;
+    last_weak[source] = weak;
+    have_last[source] = 1;
+    gc_bt_set_output(bt, source, origin, strong, weak,
+                     k_source_colour[source].r, k_source_colour[source].g,
+                     k_source_colour[source].b, k_source_colour[source].player);
+}
+
 static void push_sources(void)
 {
     for (int slot = 0; slot < HOST_MAX_PADS; ++slot) {
@@ -819,19 +858,27 @@ static void push_sources(void)
     }
     if (source_dispatch_lock()) {
         int virtual_live[GC_BT_MAX_PADS];
+        int source_slot[GC_BT_MAX_PADS];
         GcBtOrigin origins[GC_BT_MAX_PADS];
         source_snapshot_lock();
         GcBt *bt = inject_bt;
         for (int source = 0; source < GC_BT_MAX_PADS; ++source) {
             int slot = bt_map[source];
+            source_slot[source] = slot;
             virtual_live[source] = slot >= 0 && slot_live[slot];
             origins[source] = bt_active[source];
         }
         source_snapshot_unlock();
         source_dispatch_unlock();
         if (bt)
-            for (int source = 0; source < GC_BT_MAX_PADS; ++source)
+            for (int source = 0; source < GC_BT_MAX_PADS; ++source) {
                 gc_bt_set_virtual(bt, source, &origins[source], virtual_live[source]);
+                /* A game's rumble on the virtual DualSense, read back and
+                 * driven onto the physical pad. Safe when idle: the helper
+                 * no-ops unless the source is live and the level changed. */
+                feed_source_rumble(bt, source, source_slot[source],
+                                   &origins[source], virtual_live[source]);
+            }
     }
 }
 
@@ -1359,6 +1406,38 @@ static int usb_same_source(const UsbFeed *feed, const GcUsbDevice *device)
         device->kind == GC_USB_INTERFACE_HID_RAW;
 }
 
+/* Drive a USB DualShock 4's motors from the game's requested rumble. The
+ * source (vpad_rumble) reads the two motor levels the game set on our virtual
+ * DualSense; here we write them to the physical DS4 over its USB OUT pipe with
+ * output report 0x05 (byte 4 = small/right motor, byte 5 = big/left), keeping
+ * the blue lightbar the open path already set. Sent only on change; the
+ * region max does not separate the two motors, so both are driven together.
+ * vpad_rumble's staleness drops a held value back to 0, so the motors release
+ * when the effect ends. */
+static void usb_ds4_rumble(UsbFeed *feed)
+{
+    static uint8_t last[USB_SLOTS][2];
+    static int     have[USB_SLOTS];
+    unsigned idx = (unsigned)(feed - usb_feed);
+    uint8_t strong = 0, weak = 0;
+
+    if (idx >= USB_SLOTS || feed->slot < 0)
+        return;
+    if (!vpad_rumble(feed->slot, &strong, &weak)) {
+        have[idx] = 0;
+        return;
+    }
+    if (have[idx] && last[idx][0] == strong && last[idx][1] == weak)
+        return;
+    {
+        const uint8_t report[32] = { 0x05, 0x07, 0x00, 0x00, weak, strong,
+                                     0x00, 0x00, 0x40 };
+        (void)usb_send_out(feed->fd, &feed->ep[1], report, sizeof report,
+                           "ds4_rumble");
+    }
+    last[idx][0] = strong; last[idx][1] = weak; have[idx] = 1;
+}
+
 static void usb_tick(void)
 {
     GcUsbDevice devices[8];
@@ -1453,6 +1532,14 @@ static void usb_tick(void)
             describe_output(slot);
             source_snapshot_unlock();
         }
+        /* Game rumble -> DS4 USB motors. Only while the IN transfer is idle:
+         * IN (ep0) and OUT (ep1) share one ugen fd, so sending an OUT report
+         * while an IN transfer is in flight makes USB_FS_COMPLETE hand our OUT
+         * wait the IN completion instead, dropping the input packet and wedging
+         * the pad. The one-time lightbar write is safe for the same reason --
+         * it runs before IN polling starts. */
+        if (feed->ds4_out && feed->slot >= 0 && !feed->busy)
+            usb_ds4_rumble(feed);
         /* A HID device can be silent on its interrupt pipe until it is asked for
          * a report: a Switch Pro Controller over USB sends nothing at all until
          * polled. GET_REPORT is standard HID and works on any device, so ask for
